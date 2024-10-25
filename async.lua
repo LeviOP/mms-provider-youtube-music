@@ -1,72 +1,83 @@
+local inspect = require("inspect")
 local dev = false
 -- dev = true
 local function dev_print(...)
     if dev then print(...) end
 end
 
----@class Promise
----@field state "pending" | "fulfilled" | "rejected"
----@field thread thread
----@field value any
-
+-- local dbg = require("debugger")
 
 local function sync(func)
     local thread = coroutine.create(func)
     -- skip async function announcment
     coroutine.resume(thread)
     -- get async promise
+    ---@type boolean, Promise
     local _, promise = coroutine.resume(thread)
     -- start thread and run to completion
     while true do
         if coroutine.status(promise.thread) == "dead" then
             break
         end
-        coroutine.resume(promise.thread)
+        local status, error = coroutine.resume(promise.thread, function (...)
+            promise.state = "fulfilled"
+            promise.value = ...
+            coroutine.yield()
+        end)
+        if not status then print("A error happened at the top level: " .. error) end
     end
+end
+
+---@class Promise
+---@field state "pending" | "fulfilled" | "rejected"
+---@field thread thread
+---@field value any
+---@field name string?
+local Promise = {}
+Promise.__index = Promise
+
+---@param func fun(resolve: function): Promise
+function Promise:new(func, name)
+    local promise = {}
+    setmetatable(promise, Promise)
+    promise.state = "pending"
+    promise.thread = coroutine.create(func)
+    promise.name = name
+    return promise
 end
 
 ---@generic T
 ---@generic K
 ---@param func fun(...: T): K?
----@param manual? boolean
 ---@return fun(...: T): Promise<K>
-local function async(func, manual)
+local function async(func, name)
     return function (...)
         dev_print("Async function called!")
         local params = {...}
         local sync_wrapper = function () return func(unpack(params)) end
         local sync_thread = coroutine.create(sync_wrapper)
 
-        if manual then
-            ---@type Promise
-            local promise = {
-                state = "pending",
-                thread = sync_thread
-            }
-            coroutine.yield(promise, "async")
-            return promise
-        end
-
-        local function async_controller()
+        local function async_controller(resolve)
             dev_print("Starting async function controller...")
 
             ---@type table<thread, Promise>
             local promises = {}
             ---@type thread[]
-            local pending = {}
+            local running = {}
             local awaited = nil
             local toreturn = nil
             ::resumesync::
             while true do
                 dev_print("Resuming synchronous code...")
-                local yielded = { coroutine.resume(sync_thread, toreturn and unpack(toreturn)) }
+                local yielded = { coroutine.resume(sync_thread, toreturn) }
                 dev_print("Yield happened!")
                 local status = table.remove(yielded, 1)
                 if not status then print("a error (sync): " .. yielded[1]) end
 
                 if coroutine.status(sync_thread) == "dead" then
                     dev_print("Sync code returned!")
-                    return unpack(yielded)
+                    resolve(unpack(yielded))
+                    break
                 end
                 ---@type Promise
                 local promise = table.remove(yielded, 1)
@@ -76,7 +87,7 @@ local function async(func, manual)
 
                 if message == "async" then
                     dev_print("Recieved async function!")
-                    table.insert(pending, promise.thread)
+                    table.insert(running, promise.thread)
                     promises[promise.thread] = promise
                 elseif message == "await" then
                     dev_print("Received await! Promise: ", promise.state)
@@ -88,48 +99,52 @@ local function async(func, manual)
                     awaited = promise
                     break
                 else
-                    dev_print("something else returned. what the fuck")
+                    dev_print("something else returned. what the fuck:", message)
                 end
             end
             dev_print("Running promise threads...")
-            while #pending > 0 do
-                local toremove = nil
-                for i = 1, #pending do
-                    local thread = pending[i]
-                    local yielded = { coroutine.resume(thread) }
+            while #running > 0 do
+                -- Terible hack that I hate
+                local removed = 0
+                for i = 1, #running do
+                    local thread = running[i-removed]
+                    local promise = promises[thread]
+                    dev_print("Running promise thread:", promise.name)
+
+                    local r = function (...)
+                        dev_print("I am resolving.", promise.name)
+                        promise.state = "fulfilled"
+                        promise.value = ...
+                        coroutine.yield()
+                    end
+                    local yielded = { coroutine.resume(thread, r) }
+                    if coroutine.status(thread) == "dead" then
+                        dev_print("Promise thread is dead")
+                        table.remove(running, i-removed)
+                        removed = removed + 1
+                    end
+
                     dev_print("Promise thread yielded...")
                     local status = table.remove(yielded, 1)
-                    if not status then print("a error (async): " .. yielded[1]) end
+                    if not status then print("a error (async): " .. yielded[1], promise.name) end
 
-                    if coroutine.status(thread) == "dead" then
-                        dev_print("Promise fulfilled.")
-                        local promise = promises[thread]
-                        promise.state = "fulfilled"
-                        promise.value = yielded
-                        if awaited and promise == awaited then
-                            dev_print("Awaited promise fulfilled!")
-                            table.remove(pending, i)
-                            awaited = nil
-                            toreturn = yielded
-                            goto resumesync
-                        end
-                        toremove = i
+                    if awaited and promise.state == "fulfilled" and promise == awaited then
+                        dev_print("Awaited promise is fulfilled!")
+                        awaited = nil
+                        toreturn = promise.value
+                        goto resumesync
                     end
+
                 end
-                if toremove then table.remove(pending, toremove) end
                 coroutine.yield()
             end
         end
-        local async_thread = coroutine.create(async_controller)
-        ---@type Promise
-        local promise = {
-            state = "pending",
-            thread = async_thread
-        }
+        local promise = Promise:new(async_controller, name)
         coroutine.yield(promise, "async")
         return promise
     end
 end
+
 
 ---@generic T
 ---@param promise Promise<`T`>
@@ -138,8 +153,15 @@ local function await(promise)
     return coroutine.yield(promise, "await")
 end
 
+-- local function await_all(promises)
+--     for _, value in pairs(promises) do
+--         await(promise)
+--     end
+-- end
+
 return {
     async = async,
     await = await,
-    sync = sync
+    sync = sync,
+    Promise = Promise
 }
